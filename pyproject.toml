@@ -1,0 +1,12 @@
+[project]
+name = "network-event-monitoring-system"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "psutil>=7.2.2",
+    "pysmi>=1.6.3",
+    "pysnmp>=7.1.22",
+    "snmpsim>=1.2.1",
+]
