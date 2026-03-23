@@ -8,22 +8,23 @@ from pysnmp.hlapi.v3arch.asyncio import (
     get_cmd, SnmpEngine, CommunityData, UdpTransportTarget,
     ContextData, ObjectType, ObjectIdentity
 )
-
 import logging
 import threading
 import asyncio
 import os
-import re
+import json
 from collections import defaultdict
 from datetime import datetime
 
 # ─── Logging setup ────────────────────────────────────────────────────────────
+# Each line: "2026-03-22 20:00:54,049 INFO {…json…}"
+_file_handler = logging.FileHandler("traps.log")
+_file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.FileHandler("traps.log"),
-    ]
+    handlers=[_file_handler],
 )
 log = logging.getLogger("traps")
 
@@ -37,6 +38,7 @@ _mib_builder.load_modules(
 )
 _mib_view = view.MibViewController(_mib_builder)
 
+
 def resolve_oid(oid_str: str) -> str:
     try:
         oid_obj = rfc1902.ObjectName(oid_str)
@@ -47,27 +49,7 @@ def resolve_oid(oid_str: str) -> str:
         return oid_str
 
 
-# ─── Generic trap type mapping (RFC 1157) ────────────────────────────────────
-GENERIC_TRAP_TYPES = {
-    # numeric keys
-    "0": "coldStart",
-    "1": "warmStart",
-    "2": "linkDown",
-    "3": "linkUp",
-    "4": "authenticationFailure",
-    "5": "egpNeighborLoss",
-    "6": "enterpriseSpecific",
-    # named keys (newer pysnmp prettyPrint)
-    "coldStart":             "coldStart",
-    "warmStart":             "warmStart",
-    "linkDown":              "linkDown",
-    "linkUp":                "linkUp",
-    "authenticationFailure": "authenticationFailure",
-    "egpNeighborLoss":       "egpNeighborLoss",
-    "enterpriseSpecific":    "enterpriseSpecific",
-}
-
-# Standard trap OID → trap type name (used when send_notification sets the OID)
+# ─── SNMPv2c trap OID → type name ────────────────────────────────────────────
 TRAP_OID_TO_TYPE = {
     "1.3.6.1.6.3.1.1.5.1": "coldStart",
     "1.3.6.1.6.3.1.1.5.2": "warmStart",
@@ -77,14 +59,10 @@ TRAP_OID_TO_TYPE = {
     "1.3.6.1.6.3.1.1.5.6": "egpNeighborLoss",
 }
 
-def decode_trap_type(generic: str) -> str:
-    return GENERIC_TRAP_TYPES.get(str(generic).strip(), f"unknown({generic})")
-
-
 # ─── Shared state (thread-safe via lock) ─────────────────────────────────────
 trap_lock = threading.Lock()
-all_traps = []
-traps_by_node = defaultdict(list)
+all_traps: list[dict] = []
+traps_by_node: dict[str, list[dict]] = defaultdict(list)
 
 
 def store_trap(trap: dict):
@@ -93,7 +71,7 @@ def store_trap(trap: dict):
         traps_by_node[trap["agent"]].append(trap)
 
 
-# ─── SNMP GET ─────────────────────────────────────────────────────────────────
+# ─── SNMP GET (port 5161) ─────────────────────────────────────────────────────
 STATUS_OIDS = [
     ("SNMPv2-MIB", "sysDescr",    0),
     ("SNMPv2-MIB", "sysName",     0),
@@ -103,7 +81,8 @@ STATUS_OIDS = [
     ("IF-MIB",     "ifNumber",    0),
 ]
 
-def snmp_get_status(host: str, community: str = "public", port: int = 161) -> dict:
+
+def snmp_get_status(host: str, community: str = "public", port: int = 5161) -> dict:
     async def _do_get():
         results = {}
         engine = SnmpEngine()
@@ -111,7 +90,7 @@ def snmp_get_status(host: str, community: str = "public", port: int = 161) -> di
             try:
                 error_indication, error_status, error_index, var_binds = await get_cmd(
                     engine,
-                    CommunityData(community, mpModel=1),
+                    CommunityData(community, mpModel=1),   # mpModel=1 → SNMPv2c
                     await UdpTransportTarget.create((host, port), timeout=2, retries=1),
                     ContextData(),
                     ObjectType(ObjectIdentity(mib, sym, idx)),
@@ -139,14 +118,13 @@ def snmp_get_status(host: str, community: str = "public", port: int = 161) -> di
 
 
 def display_node_status():
-    host = input("\n  Enter node IP address : ").strip()
+    host      = input("\n  Enter node IP address : ").strip()
     community = input("  Community string [public]: ").strip() or "public"
-    port_str  = input("  SNMP port [1161]: ").strip()
-    port = int(port_str) if port_str.isdigit() else 1161
+    port_str  = input("  SNMP port [5161]: ").strip()
+    port      = int(port_str) if port_str.isdigit() else 5161
 
     print(f"\n  Polling {host}:{port} (community='{community}') ...")
     results = snmp_get_status(host, community, port)
-
     if not results:
         print("  [No response or no data returned]\n")
         return
@@ -157,69 +135,58 @@ def display_node_status():
     print("  " + "-" * 56)
 
 
-# ─── SNMP callback ────────────────────────────────────────────────────────────
+# ─── SNMP trap callback (SNMPv2c only, port 5162) ────────────────────────────
 def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
     while wholeMsg:
         msgVer = int(api.decodeMessageVersion(wholeMsg))
-        if msgVer in api.PROTOCOL_MODULES:
-            pMod = api.PROTOCOL_MODULES[msgVer]
-        else:
-            log.warning("Unsupported SNMP version %s" % msgVer)
+
+        # Accept SNMPv2c only (version tag == 1 in the wire encoding)
+        if msgVer != api.SNMP_VERSION_2C:
+            log.warning("Dropped non-SNMPv2c message (version=%s)", msgVer)
             return
 
-        reqMsg, wholeMsg = decoder.decode(
-            wholeMsg,
-            asn1Spec=pMod.Message(),
-        )
-
+        pMod = api.PROTOCOL_MODULES[msgVer]
+        reqMsg, wholeMsg = decoder.decode(wholeMsg, asn1Spec=pMod.Message())
         reqPDU = pMod.apiMessage.get_pdu(reqMsg)
-        if reqPDU.isSameTypeWith(pMod.TrapPDU()):
-            trap = {"timestamp": datetime.now().isoformat(), "version": msgVer}
 
-            if msgVer == api.SNMP_VERSION_1:
-                trap["agent"]         = transportAddress[0]
-                ent_oid               = pMod.apiTrapPDU.get_enterprise(reqPDU).prettyPrint()
-                trap["enterprise"]    = f"{resolve_oid(ent_oid)}  ({ent_oid})"
-                generic_val       = pMod.apiTrapPDU.get_generic_trap(reqPDU).prettyPrint()
-                specific_val      = pMod.apiTrapPDU.get_specific_trap(reqPDU).prettyPrint()
-                # Try to resolve trap type from enterprise OID first, then generic field
-                trap["trap_type"] = (
-                    TRAP_OID_TO_TYPE.get(ent_oid)
-                    or decode_trap_type(generic_val)
-                )
-                trap["uptime"]        = pMod.apiTrapPDU.get_timestamp(reqPDU).prettyPrint()
+        if not reqPDU.isSameTypeWith(pMod.TrapPDU()):
+            return
 
-                varbinds = {}
-                for oid, val in pMod.apiTrapPDU.get_varbinds(reqPDU):
-                    varbinds[resolve_oid(oid.prettyPrint())] = val.prettyPrint()
-                trap["varbinds"] = varbinds
+        agent = transportAddress[0]
+        varbinds: dict[str, str] = {}
+        trap_oid: str | None     = None
+        event_type: str | None   = None
+
+        for oid, val in pMod.apiPDU.get_varbinds(reqPDU):
+            oid_str = oid.prettyPrint()
+            val_str = val.prettyPrint()
+
+            if oid_str == "1.3.6.1.6.3.1.1.4.1.0":          # snmpTrapOID
+                trap_oid   = val_str
+                event_type = TRAP_OID_TO_TYPE.get(val_str)
+            elif oid_str == "1.3.6.1.4.1.53864.1.1":         # enterprise event type
+                event_type = val_str
             else:
-                # SNMPv2c trap — extract event type from enterprise varbind 53864.1.1
-                trap["agent"] = transportAddress[0]
-                varbinds = {}
-                event_type = None
-                for oid, val in pMod.apiPDU.get_varbinds(reqPDU):
-                    oid_str = oid.prettyPrint()
-                    val_str = val.prettyPrint()
-                    if oid_str == "1.3.6.1.6.3.1.1.4.1.0":
-                        # snmpTrapOID — skip, we use event_type varbind instead
-                        continue
-                    elif oid_str == "1.3.6.1.4.1.53864.1.1":
-                        event_type = val_str
-                    else:
-                        varbinds[resolve_oid(oid_str)] = val_str
-                trap["trap_type"] = event_type or "unknown"
-                trap["enterprise"] = f"{resolve_oid('1.3.6.1.4.1.53864.1.0')}  (1.3.6.1.4.1.53864.1.0)"
-                trap["uptime"] = "N/A"
-                trap["varbinds"] = varbinds
+                varbinds[resolve_oid(oid_str)] = val_str
 
-            log.info("Trap from %s | %s", trap["agent"], trap.get("enterprise", ""))
-            store_trap(trap)
+        trap = {
+            "ts":         datetime.now().isoformat(),
+            "agent":      agent,
+            "version":    "SNMPv2c",
+            "trap_type":  event_type or (TRAP_OID_TO_TYPE.get(trap_oid) if trap_oid else None) or "unknown",
+            "trap_oid":   trap_oid,
+            "enterprise": resolve_oid("1.3.6.1.4.1.53864.1.0"),
+            "varbinds":   varbinds,
+        }
+
+        # One compact JSON line per trap
+        log.info(json.dumps(trap, separators=(",", ":")))
+        store_trap(trap)
 
     return wholeMsg
 
 
-# ─── Background dispatcher thread ────────────────────────────────────────────
+# ─── Background dispatcher thread (port 5162) ────────────────────────────────
 def run_dispatcher():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -231,27 +198,27 @@ def run_dispatcher():
     )
     transportDispatcher.register_recv_callback(callback)
     transportDispatcher.job_started(1)
+    log.info(json.dumps({"event": "listener_started", "host": "localhost", "port": 5162}))
 
-    log.info("SNMP trap listener started on localhost:5162")
     try:
         transportDispatcher.run_dispatcher()
     except Exception as e:
-        log.error("Dispatcher error: %s", e)
+        log.error(json.dumps({"event": "dispatcher_error", "error": str(e)}))
     finally:
         transportDispatcher.close_dispatcher()
 
 
 # ─── Display helpers ──────────────────────────────────────────────────────────
 def print_trap(trap: dict):
-    print(f"\n  Timestamp : {trap['timestamp']}")
+    print(f"\n  Timestamp : {trap.get('ts', trap.get('timestamp', 'N/A'))}")
     print(f"  Agent     : {trap['agent']}")
-    if "enterprise" in trap:
-        print(f"  Trap Type : {trap.get('trap_type', 'unknown')}")
-        print(f"  Enterprise: {trap['enterprise']}")
-        print(f"  Uptime    : {trap['uptime']}")
-    if trap["varbinds"]:
+    print(f"  Trap Type : {trap.get('trap_type', 'unknown')}")
+    print(f"  Trap OID  : {trap.get('trap_oid', 'N/A')}")
+    print(f"  Enterprise: {trap.get('enterprise', 'N/A')}")
+    varbinds = trap.get("varbinds", {})
+    if varbinds:
         print("  VarBinds:")
-        for oid, val in trap["varbinds"].items():
+        for oid, val in varbinds.items():
             print(f"    {oid} = {val}")
     else:
         print("  VarBinds  : none")
@@ -279,7 +246,7 @@ def display_all_traps():
         while not stop_event.is_set():
             with trap_lock:
                 current_len = len(all_traps)
-                new_traps = list(all_traps[last_seen:current_len])
+                new_traps   = list(all_traps[last_seen:current_len])
             if new_traps:
                 for trap in new_traps:
                     print_trap(trap)
@@ -288,7 +255,6 @@ def display_all_traps():
 
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
-
     try:
         input()
     except (EOFError, KeyboardInterrupt):
@@ -302,84 +268,48 @@ def display_node_history():
     node = input("\n  Enter node IP address: ").strip()
     with trap_lock:
         traps = list(traps_by_node.get(node, []))
-
     if not traps:
         print(f"\n  [No traps recorded for {node}]\n")
         return
-
     print(f"\n  === Trap history for {node} ({len(traps)} entries) ===")
     for trap in traps:
         print_trap(trap)
 
 
-# ─── Log file parser ─────────────────────────────────────────────────────────
-LOG_LINE_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)\s+\w+\s+(.+)$"
-)
-
-def load_traps_from_log(log_path: str = "traps.log"):
+# ─── JSON log parser ──────────────────────────────────────────────────────────
+def load_traps_from_log(log_path: str = "traps.log") -> int:
+    """
+    Each data line in traps.log is a single compact JSON object written by
+    log.info(json.dumps(trap)).  Non-JSON lines (startup messages, errors)
+    are silently skipped.
+    """
     if not os.path.exists(log_path):
         return 0
 
     loaded = 0
-    current = None
-    in_varbinds = False
+    with open(log_path, "r", errors="replace") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            # Strip leading log-level prefix if present (e.g. "2024-… INFO ")
+            # The JSON payload always starts with '{'
+            brace = line.find("{")
+            if brace == -1:
+                continue
+            json_str = line[brace:]
+            try:
+                trap = json.loads(json_str)
+            except json.JSONDecodeError:
+                continue
 
-    def flush(trap):
-        nonlocal loaded
-        if trap and "agent" in trap:
-            trap.setdefault("varbinds", {})
+            # Must look like a trap record (has agent) — skip meta events
+            if "agent" not in trap:
+                continue
+
             store_trap(trap)
             loaded += 1
 
-    with open(log_path, "r", errors="replace") as f:
-        for raw_line in f:
-            line = raw_line.rstrip()
-            m = LOG_LINE_RE.match(line)
-            if not m:
-                if current and in_varbinds and "=" in line:
-                    oid, _, val = line.strip().partition(" = ")
-                    current["varbinds"][resolve_oid(oid.strip())] = val.strip()
-                continue
-
-            timestamp, body = m.group(1), m.group(2).strip()
-
-            if body.startswith("Agent Address:"):
-                flush(current)
-                current = {
-                    "timestamp": timestamp,
-                    "agent": body.split(":", 1)[1].strip(),
-                    "varbinds": {},
-                    "source": "log",
-                }
-                in_varbinds = False
-
-            elif current is None:
-                continue
-
-            elif body.startswith("Enterprise:"):
-                raw_oid = body.split(":", 1)[1].strip()
-                current["enterprise"] = f"{resolve_oid(raw_oid)}  ({raw_oid})"
-                in_varbinds = False
-
-            elif body.startswith("Uptime:"):
-                current["uptime"] = body.split(":", 1)[1].strip()
-                in_varbinds = False
-
-            elif body.strip() == "VarBinds:":
-                in_varbinds = True
-
-            elif body.startswith("VarBinds:") and body != "VarBinds:":
-                in_varbinds = False
-
-            elif in_varbinds and "=" in body:
-                oid, _, val = body.partition(" = ")
-                current["varbinds"][resolve_oid(oid.strip())] = val.strip()
-
-            else:
-                in_varbinds = False
-
-    flush(current)
     return loaded
 
 
@@ -389,8 +319,7 @@ def main():
 
     listener = threading.Thread(target=run_dispatcher, daemon=True)
     listener.start()
-
-    print("  SNMP Trap Listener running in background (localhost:5162)\n")
+    print("  SNMP Trap Listener running in background")
 
     while True:
         print("\n  ┌──────────────────────────────────┐")
@@ -401,7 +330,6 @@ def main():
         print("  │  3. Get current status of node   │")
         print("  │  4. Exit                         │")
         print("  └──────────────────────────────────┘")
-
         try:
             choice = input("  Select option [1-4]: ").strip()
         except (EOFError, KeyboardInterrupt):
