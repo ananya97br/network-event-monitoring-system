@@ -17,7 +17,6 @@ from collections import defaultdict
 from datetime import datetime
 
 # ─── Logging setup ────────────────────────────────────────────────────────────
-# Each line: "2026-03-22 20:00:54,049 INFO {…json…}"
 _file_handler = logging.FileHandler("traps.log")
 _file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 
@@ -220,7 +219,7 @@ def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
         reqMsg, wholeMsg = decoder.decode(wholeMsg, asn1Spec=pMod.Message())
         reqPDU = pMod.apiMessage.get_pdu(reqMsg)
 
-        if not reqPDU.isSameTypeWith(pMod.TrapPDU()):
+        if not reqPDU.isSameTypeWith(pMod.TrapV2PDU()):
             return
 
         agent      = transportAddress[0]
@@ -228,7 +227,7 @@ def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
         trap_oid: str | None     = None
         event_type: str | None   = None
 
-        for oid, val in pMod.apiPDU.get_varbinds(reqPDU):
+        for oid, val in pMod.apiTrapPDU.get_varbinds(reqPDU):
             oid_str = oid.prettyPrint()
             val_str = val.prettyPrint()
 
@@ -265,11 +264,11 @@ def run_dispatcher():
     transportDispatcher = AsyncioDispatcher()
     transportDispatcher.register_transport(
         udp.DOMAIN_NAME,
-        udp.UdpAsyncioTransport().open_server_mode(("localhost", 5162))
+        udp.UdpAsyncioTransport().open_server_mode(("0.0.0.0", 5162))
     )
     transportDispatcher.register_recv_callback(callback)
     transportDispatcher.job_started(1)
-    log.info(json.dumps({"event": "listener_started", "host": "localhost", "port": 5162}))
+    log.info(json.dumps({"event": "listener_started", "host": "0.0.0.0", "port": 5162}))
 
     try:
         transportDispatcher.run_dispatcher()
