@@ -219,7 +219,7 @@ def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
         reqMsg, wholeMsg = decoder.decode(wholeMsg, asn1Spec=pMod.Message())
         reqPDU = pMod.apiMessage.get_pdu(reqMsg)
 
-        if not reqPDU.isSameTypeWith(pMod.TrapV2PDU()):
+        if not reqPDU.isSameTypeWith(pMod.TrapPDU()):  # Fixed: TrapV2PDU → TrapPDU
             return
 
         agent      = transportAddress[0]
