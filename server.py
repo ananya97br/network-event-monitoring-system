@@ -1,9 +1,8 @@
 from pysnmp.carrier.asyncio.dgram import udp
 from pysnmp.carrier.asyncio.dispatch import AsyncioDispatcher
 from pyasn1.codec.ber import decoder
-from pysnmp.proto import api
+from pysnmp.proto import api, rfc1902
 from pysnmp.smi import builder, view, compiler
-from pysnmp.proto import rfc1902
 from pysnmp.hlapi.v3arch.asyncio import (
     get_cmd, SnmpEngine, CommunityData, UdpTransportTarget,
     ContextData, ObjectType, ObjectIdentity
@@ -77,12 +76,9 @@ STATUS_OIDS_MIB = [
     ("SNMPv2-MIB", "sysName",     0),
     ("SNMPv2-MIB", "sysLocation", 0),
     ("SNMPv2-MIB", "sysContact",  0),
-    ("SNMPv2-MIB", "sysUpTime",   0),
     ("IF-MIB",     "ifNumber",    0),
 ]
 
-# Enterprise OIDs — the node agent exposes these at 1.3.6.1.4.1.53864.1.*
-# 53864.1.3 returns a JSON blob: cpu_count, load_*, ip, node, uptime, process_count
 STATUS_OIDS_ENTERPRISE = [
     "1.3.6.1.4.1.53864.1.1",   # event / trap type string
     "1.3.6.1.4.1.53864.1.2",   # ISO timestamp from agent
@@ -91,13 +87,6 @@ STATUS_OIDS_ENTERPRISE = [
 
 
 def snmp_get_status(host: str, community: str = "public", port: int = 5161) -> dict:
-    """
-    Server → GET request → node agent (port 5161)
-    Node agent → GET-Response → server
-
-    Returns a flat dict { resolved_oid_label: value_string } built from
-    everything the agent sends back.
-    """
     async def _do_get():
         results: dict[str, str] = {}
         engine    = SnmpEngine()
@@ -154,22 +143,12 @@ def snmp_get_status(host: str, community: str = "public", port: int = 5161) -> d
 
 
 def display_node_status():
-    """
-    Option 3 — pure GET flow:
-      1. Server sends SNMPv2c GET to node agent on port 5161
-      2. Agent sends back GET-Response with standard MIB values
-         AND enterprise OIDs (including JSON metrics blob at 53864.1.3)
-      3. Server displays everything the agent returned
-    No stored trap data is used here.
-    """
     host      = input("\n  Enter node IP address : ").strip()
     community = input("  Community string [public]: ").strip() or "public"
-    port_str  = input("  SNMP port [5161]: ").strip()
-    port      = int(port_str) if port_str.isdigit() else 5161
 
-    print(f"\n  Sending GET to agent {host}:{port} ...")
+    print(f"\n  Sending GET to agent {host}:5161 ...")
 
-    results = snmp_get_status(host, community, port)
+    results = snmp_get_status(host, community, 5161)
 
     print(f"\n  {'=' * 54}")
     print(f"  Node Status  —  {host}")
@@ -283,8 +262,6 @@ def print_trap(trap: dict):
     print(f"\n  Timestamp : {trap.get('ts', trap.get('timestamp', 'N/A'))}")
     print(f"  Agent     : {trap['agent']}")
     print(f"  Trap Type : {trap.get('trap_type', 'unknown')}")
-    print(f"  Trap OID  : {trap.get('trap_oid', 'N/A')}")
-    print(f"  Enterprise: {trap.get('enterprise', 'N/A')}")
     varbinds = trap.get("varbinds", {})
     if varbinds:
         print("  VarBinds:")

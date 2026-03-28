@@ -16,20 +16,21 @@ from pysnmp.hlapi.v3arch.asyncio import (
     NotificationType,
     ObjectIdentity,
     OctetString,
+    TimeTicks,
     SnmpEngine,
     UdpTransportTarget,
     send_notification,
 )
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-SERVER_HOST                = os.getenv("SERVER_HOST",                "127.0.0.1")
-TRAP_PORT                  = int(os.getenv("TRAP_PORT",              "5162"))
-STATUS_PORT                = int(os.getenv("STATUS_PORT",            "5161"))
-COMMUNITY                  = os.getenv("COMMUNITY",                  "public")
+SERVER_HOST                = os.getenv("SERVER_HOST", "127.0.0.1")
+TRAP_PORT                  = 5162
+STATUS_PORT                = 5161
+COMMUNITY                  = os.getenv("COMMUNITY", "public")
 POLL_INTERVAL_SECONDS      = int(os.getenv("POLL_INTERVAL_SECONDS",  "5"))
 HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "60"))
 LOAD_HIGH_FACTOR           = float(os.getenv("LOAD_HIGH_FACTOR",    "1.0"))
-PROCESS_DELTA_THRESHOLD    = int(os.getenv("PROCESS_DELTA_THRESHOLD","20"))
+PROCESS_DELTA_THRESHOLD    = int(os.getenv("PROCESS_DELTA_THRESHOLD","20")) 
 
 # ─── Enterprise OIDs ──────────────────────────────────────────────────────────
 TRAP_OID          = "1.3.6.1.4.1.53864.1.0"
@@ -88,6 +89,7 @@ def collect_status() -> dict:
 # ─── SNMP trap sender ─────────────────────────────────────────────────────────
 async def send_trap(event_type: str, details: dict) -> None:
     details_json = json.dumps(details, sort_keys=True)
+    uptime_ticks = int((time.time() - STARTED_AT) * 100)  # centiseconds
     try:
         error_indication, error_status, error_index, var_binds = await send_notification(
             SnmpEngine(),
@@ -96,6 +98,7 @@ async def send_trap(event_type: str, details: dict) -> None:
             ContextData(),
             "trap",
             NotificationType(ObjectIdentity(TRAP_OID)).add_varbinds(
+                (ObjectIdentity("1.3.6.1.2.1.1.3.0"), TimeTicks(uptime_ticks)),
                 (ObjectIdentity(EVENT_TYPE_OID),    OctetString(event_type)),
                 (ObjectIdentity(EVENT_TIME_OID),    OctetString(datetime.now(timezone.utc).isoformat())),
                 (ObjectIdentity(EVENT_DETAILS_OID), OctetString(details_json)),
@@ -112,11 +115,6 @@ async def send_trap(event_type: str, details: dict) -> None:
 
 # ─── SNMP GET responder (port 5161) ───────────────────────────────────────────
 def _build_get_response(req_msg, pMod, status: dict) -> bytes:
-    """
-    Build a GetResponse PDU from the incoming GetRequest.
-    Walks the requested OIDs and fills in values from the current node status.
-    Unknown OIDs get a noSuchObject error index.
-    """
     req_pdu = pMod.apiMessage.get_pdu(req_msg)
 
     # Build OID → value map from live status
@@ -135,12 +133,10 @@ def _build_get_response(req_msg, pMod, status: dict) -> bytes:
         EVENT_DETAILS_OID:pMod.OctetString(details_json),
     }
 
-    # Clone request into a response PDU
     resp_pdu = pMod.GetResponsePDU()
     pMod.apiPDU.set_defaults(resp_pdu)
     pMod.apiPDU.set_request_id(resp_pdu, pMod.apiPDU.get_request_id(req_pdu))
 
-    # Fill varbinds
     var_binds = []
     for req_oid, _ in pMod.apiPDU.get_varbinds(req_pdu):
         oid_str = req_oid.prettyPrint()
@@ -152,7 +148,6 @@ def _build_get_response(req_msg, pMod, status: dict) -> bytes:
 
     pMod.apiPDU.set_varbinds(resp_pdu, var_binds)
 
-    # Wrap in a Message
     resp_msg = pMod.Message()
     pMod.apiMessage.set_defaults(resp_msg)
     pMod.apiMessage.set_community(
