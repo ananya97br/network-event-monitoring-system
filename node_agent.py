@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from cryptography.fernet import Fernet
 
+import psutil
 from pysnmp.carrier.asyncio.dgram import udp
 from pysnmp.carrier.asyncio.dispatch import AsyncioDispatcher
 from pyasn1.codec.ber import decoder, encoder
@@ -84,7 +85,12 @@ def _local_ip() -> str:
 
 def collect_status() -> dict:
     cpu_count = os.cpu_count() or 1
-    load1, load5, load15 = os.getloadavg()
+    if hasattr(os, 'getloadavg'):
+        load1, load5, load15 = os.getloadavg()  # Unix/macOS only
+    else:
+        # Windows fallback: use current CPU utilization as a proxy
+        cpu_percent = psutil.cpu_percent(interval=1)
+        load1 = load5 = load15 = (cpu_percent / 100) * cpu_count
     process_count = len([p for p in os.listdir("/proc") if p.isdigit()])
     return {
         "node":           _hostname(),
