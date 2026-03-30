@@ -7,6 +7,7 @@ from pysnmp.hlapi.v3arch.asyncio import (
     get_cmd, SnmpEngine, CommunityData, UdpTransportTarget,
     ContextData, ObjectType, ObjectIdentity
 )
+from cryptography.fernet import Fernet, InvalidToken
 import logging
 import threading
 import asyncio
@@ -25,6 +26,21 @@ logging.basicConfig(
     handlers=[_file_handler],
 )
 log = logging.getLogger("traps")
+
+# ─── Symmetric encryption (Fernet / AES-128) ─────────────────────────────────
+# Must match the key in node_agent.py exactly.
+FERNET_KEY = b"x81EKjn14CbZmChtM_G1A0zFprkP7CGi_OcEX32ZBxw="
+_fernet = Fernet(FERNET_KEY)
+
+
+def decrypt(ciphertext: str) -> str:
+    """Decrypt a Fernet ciphertext string → UTF-8 plaintext. Returns raw value on failure."""
+    try:
+        return _fernet.decrypt(ciphertext.encode()).decode()
+    except InvalidToken:
+        log.warning("Decryption failed — wrong key or tampered data")
+        return ciphertext
+
 
 # ─── MIB / OID resolution setup ──────────────────────────────────────────────
 _mib_builder = builder.MibBuilder()
@@ -70,7 +86,6 @@ def store_trap(trap: dict):
 
 
 # ─── SNMP GET (port 5161) ─────────────────────────────────────────────────────
-# Standard MIB OIDs — the server sends GET, the node agent replies with GET-Response
 STATUS_OIDS_MIB = [
     ("SNMPv2-MIB", "sysDescr",    0),
     ("SNMPv2-MIB", "sysName",     0),
@@ -82,7 +97,7 @@ STATUS_OIDS_MIB = [
 STATUS_OIDS_ENTERPRISE = [
     "1.3.6.1.4.1.53864.1.1",   # event / trap type string
     "1.3.6.1.4.1.53864.1.2",   # ISO timestamp from agent
-    "1.3.6.1.4.1.53864.1.3",   # JSON payload: cpu_count, load_*, ip, node, uptime…
+    "1.3.6.1.4.1.53864.1.3",   # encrypted JSON payload
 ]
 
 
@@ -90,12 +105,11 @@ def snmp_get_status(host: str, community: str = "public", port: int = 5161) -> d
     async def _do_get():
         results: dict[str, str] = {}
         engine    = SnmpEngine()
-        auth      = CommunityData(community, mpModel=1)   # SNMPv2c
+        auth      = CommunityData(community, mpModel=1)
         transport = await UdpTransportTarget.create(
             (host, port), timeout=2, retries=1
         )
 
-        # ── Batch 1: standard MIB OIDs ───────────────────────
         for mib, sym, idx in STATUS_OIDS_MIB:
             try:
                 err_ind, err_status, err_idx, var_binds = await get_cmd(
@@ -114,7 +128,6 @@ def snmp_get_status(host: str, community: str = "public", port: int = 5161) -> d
             except Exception as exc:
                 results[f"{mib}::{sym}.{idx}"] = f"EXCEPTION: {exc}"
 
-        # ── Batch 2: enterprise OIDs (custom node metrics) ───
         for raw_oid in STATUS_OIDS_ENTERPRISE:
             label = resolve_oid(raw_oid)
             try:
@@ -128,7 +141,12 @@ def snmp_get_status(host: str, community: str = "public", port: int = 5161) -> d
                     results[label] = f"ERROR: {err_status.prettyPrint()}"
                 else:
                     for oid, val in var_binds:
-                        results[resolve_oid(oid.prettyPrint())] = val.prettyPrint()
+                        resolved = resolve_oid(oid.prettyPrint())
+                        raw_val  = val.prettyPrint()
+                        # Decrypt the JSON metrics payload
+                        if "53864.1.3" in oid.prettyPrint():
+                            raw_val = decrypt(raw_val)
+                        results[resolved] = raw_val
             except Exception as exc:
                 results[label] = f"EXCEPTION: {exc}"
 
@@ -158,19 +176,16 @@ def display_node_status():
         print("  [No GET-Response received from agent]\n")
         return
 
-    # Enterprise JSON payload (53864.1.3) is pretty-printed separately
     enterprise_json_key = next(
         (k for k in results if "53864.1.3" in k), None
     )
 
-    # ── Standard + non-JSON enterprise values ────────────────
     for oid, val in results.items():
         if oid == enterprise_json_key:
             continue
         label = oid.split("::")[-1] if "::" in oid else oid
         print(f"  {label:<32} {val}")
 
-    # ── Enterprise JSON metrics (cpu, load, node name, …) ────
     if enterprise_json_key:
         raw = results[enterprise_json_key]
         print(f"\n  [ Node Metrics ]")
@@ -189,7 +204,6 @@ def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
     while wholeMsg:
         msgVer = int(api.decodeMessageVersion(wholeMsg))
 
-        # Accept SNMPv2c only
         if msgVer != api.SNMP_VERSION_2C:
             log.warning("Dropped non-SNMPv2c message (version=%s)", msgVer)
             return
@@ -198,7 +212,7 @@ def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
         reqMsg, wholeMsg = decoder.decode(wholeMsg, asn1Spec=pMod.Message())
         reqPDU = pMod.apiMessage.get_pdu(reqMsg)
 
-        if not reqPDU.isSameTypeWith(pMod.TrapPDU()):  # Fixed: TrapV2PDU → TrapPDU
+        if not reqPDU.isSameTypeWith(pMod.TrapPDU()):
             return
 
         agent      = transportAddress[0]
@@ -215,6 +229,9 @@ def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
                 event_type = TRAP_OID_TO_TYPE.get(val_str)
             elif oid_str == "1.3.6.1.4.1.53864.1.1":      # enterprise event type
                 event_type = val_str
+            elif oid_str == "1.3.6.1.4.1.53864.1.3":      # encrypted JSON payload
+                val_str = decrypt(val_str)
+                varbinds[resolve_oid(oid_str)] = val_str
             else:
                 varbinds[resolve_oid(oid_str)] = val_str
 
@@ -228,7 +245,6 @@ def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
             "varbinds":   varbinds,
         }
 
-        # One compact JSON line per trap
         log.info(json.dumps(trap, separators=(",", ":")))
         store_trap(trap)
 
@@ -262,7 +278,7 @@ def print_trap(trap: dict):
     print(f"\n  Timestamp : {trap.get('ts', trap.get('timestamp', 'N/A'))}")
     print(f"  Agent     : {trap['agent']}")
     print(f"  Trap Type : {trap.get('trap_type', 'unknown')}")
-    varbinds = trap.get("varbinds", {})
+    varbinds = {k: v for k, v in trap.get("varbinds", {}).items() if "sysUpTime" not in k}
     if varbinds:
         print("  VarBinds:")
         for oid, val in varbinds.items():
@@ -326,8 +342,8 @@ def display_node_history():
 # ─── JSON log parser ──────────────────────────────────────────────────────────
 def load_traps_from_log(log_path: str = "traps.log") -> int:
     """
-    Each trap line: "2026-03-22 20:00:54,049 INFO {…json…}"
-    Skips meta-event lines (no "agent" key) and malformed lines silently.
+    Traps are already decrypted before being stored, so the log contains
+    plaintext JSON — no decryption needed here.
     """
     if not os.path.exists(log_path):
         return 0

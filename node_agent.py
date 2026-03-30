@@ -6,6 +6,8 @@ import socket
 import time
 from datetime import datetime, timezone
 
+from cryptography.fernet import Fernet
+
 from pysnmp.carrier.asyncio.dgram import udp
 from pysnmp.carrier.asyncio.dispatch import AsyncioDispatcher
 from pyasn1.codec.ber import decoder, encoder
@@ -26,11 +28,22 @@ from pysnmp.hlapi.v3arch.asyncio import (
 SERVER_HOST                = os.getenv("SERVER_HOST", "127.0.0.1")
 TRAP_PORT                  = 5162
 STATUS_PORT                = 5161
-COMMUNITY                  = os.getenv("COMMUNITY", "public")
-POLL_INTERVAL_SECONDS      = int(os.getenv("POLL_INTERVAL_SECONDS",  "5"))
-HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "60"))
-LOAD_HIGH_FACTOR           = float(os.getenv("LOAD_HIGH_FACTOR",    "1.0"))
-PROCESS_DELTA_THRESHOLD    = int(os.getenv("PROCESS_DELTA_THRESHOLD","20")) 
+COMMUNITY                  = "public"
+POLL_INTERVAL_SECONDS      = 5
+HEARTBEAT_INTERVAL_SECONDS = 60
+LOAD_HIGH_FACTOR           = 1.0
+PROCESS_DELTA_THRESHOLD    = 20
+
+# ─── Symmetric encryption (Fernet / AES-128) ─────────────────────────────────
+# Must match the key in server.py exactly.
+FERNET_KEY = b"x81EKjn14CbZmChtM_G1A0zFprkP7CGi_OcEX32ZBxw="
+_fernet = Fernet(FERNET_KEY)
+
+
+def encrypt(plaintext: str) -> str:
+    """Encrypt a UTF-8 string → URL-safe base64 ciphertext string."""
+    return _fernet.encrypt(plaintext.encode()).decode()
+
 
 # ─── Enterprise OIDs ──────────────────────────────────────────────────────────
 TRAP_OID          = "1.3.6.1.4.1.53864.1.0"
@@ -88,8 +101,10 @@ def collect_status() -> dict:
 
 # ─── SNMP trap sender ─────────────────────────────────────────────────────────
 async def send_trap(event_type: str, details: dict) -> None:
-    details_json = json.dumps(details, sort_keys=True)
-    uptime_ticks = int((time.time() - STARTED_AT) * 100)  # centiseconds
+    # Encrypt the JSON payload before sending
+    details_json      = json.dumps(details, sort_keys=True)
+    encrypted_details = encrypt(details_json)
+    uptime_ticks      = int((time.time() - STARTED_AT) * 100)  # centiseconds
     try:
         error_indication, error_status, error_index, var_binds = await send_notification(
             SnmpEngine(),
@@ -99,9 +114,9 @@ async def send_trap(event_type: str, details: dict) -> None:
             "trap",
             NotificationType(ObjectIdentity(TRAP_OID)).add_varbinds(
                 (ObjectIdentity("1.3.6.1.2.1.1.3.0"), TimeTicks(uptime_ticks)),
-                (ObjectIdentity(EVENT_TYPE_OID),    OctetString(event_type)),
-                (ObjectIdentity(EVENT_TIME_OID),    OctetString(datetime.now(timezone.utc).isoformat())),
-                (ObjectIdentity(EVENT_DETAILS_OID), OctetString(details_json)),
+                (ObjectIdentity(EVENT_TYPE_OID),       OctetString(event_type)),
+                (ObjectIdentity(EVENT_TIME_OID),       OctetString(datetime.now(timezone.utc).isoformat())),
+                (ObjectIdentity(EVENT_DETAILS_OID),    OctetString(encrypted_details)),  # encrypted
             ),
         )
         if error_indication:
@@ -117,20 +132,21 @@ async def send_trap(event_type: str, details: dict) -> None:
 def _build_get_response(req_msg, pMod, status: dict) -> bytes:
     req_pdu = pMod.apiMessage.get_pdu(req_msg)
 
-    # Build OID → value map from live status
-    details_json = json.dumps(status, sort_keys=True)
-    uptime_ticks = int((time.time() - STARTED_AT) * 100)  # centiseconds
+    # Encrypt the JSON payload before putting it in the GET response
+    details_json      = json.dumps(status, sort_keys=True)
+    encrypted_details = encrypt(details_json)
+    uptime_ticks      = int((time.time() - STARTED_AT) * 100)  # centiseconds
 
     oid_values = {
-        SYS_DESCR_OID:    pMod.OctetString(f"Node agent on {status['node']} running Python"),
-        SYS_NAME_OID:     pMod.OctetString(status["node"]),
-        SYS_LOCATION_OID: pMod.OctetString(status.get("ip", "unknown")),
-        SYS_CONTACT_OID:  pMod.OctetString("node-agent"),
-        SYS_UPTIME_OID:   pMod.TimeTicks(uptime_ticks),
-        IF_NUMBER_OID:    pMod.Integer(0),
-        EVENT_TYPE_OID:   pMod.OctetString("getResponse"),
-        EVENT_TIME_OID:   pMod.OctetString(status["timestamp"]),
-        EVENT_DETAILS_OID:pMod.OctetString(details_json),
+        SYS_DESCR_OID:     pMod.OctetString(f"Node agent on {status['node']} running Python"),
+        SYS_NAME_OID:      pMod.OctetString(status["node"]),
+        SYS_LOCATION_OID:  pMod.OctetString(status.get("ip", "unknown")),
+        SYS_CONTACT_OID:   pMod.OctetString("node-agent"),
+        SYS_UPTIME_OID:    pMod.TimeTicks(uptime_ticks),
+        IF_NUMBER_OID:     pMod.Integer(0),
+        EVENT_TYPE_OID:    pMod.OctetString("getResponse"),
+        EVENT_TIME_OID:    pMod.OctetString(status["timestamp"]),
+        EVENT_DETAILS_OID: pMod.OctetString(encrypted_details),  # encrypted
     }
 
     resp_pdu = pMod.GetResponsePDU()
@@ -143,7 +159,6 @@ def _build_get_response(req_msg, pMod, status: dict) -> bytes:
         if oid_str in oid_values:
             var_binds.append((req_oid, oid_values[oid_str]))
         else:
-            # OID not supported — return noSuchObject
             var_binds.append((req_oid, pMod.NoSuchObject("")))
 
     pMod.apiPDU.set_varbinds(resp_pdu, var_binds)
@@ -159,12 +174,6 @@ def _build_get_response(req_msg, pMod, status: dict) -> bytes:
 
 
 def make_get_responder():
-    """
-    Returns a callback for AsyncioDispatcher that:
-      - accepts SNMPv2c GetRequest PDUs
-      - collects live node status
-      - sends back a GetResponse
-    """
     def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
         while wholeMsg:
             msgVer = int(api.decodeMessageVersion(wholeMsg))
@@ -176,7 +185,6 @@ def make_get_responder():
             req_msg, wholeMsg = decoder.decode(wholeMsg, asn1Spec=pMod.Message())
             req_pdu = pMod.apiMessage.get_pdu(req_msg)
 
-            # Only respond to GetRequest PDUs
             if not req_pdu.isSameTypeWith(pMod.GetRequestPDU()):
                 return
 
@@ -206,7 +214,6 @@ def make_get_responder():
 
 
 def run_get_responder():
-    """Runs the GET responder in its own thread with its own event loop."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -266,7 +273,6 @@ async def main() -> None:
         SERVER_HOST, TRAP_PORT, STATUS_PORT,
     )
 
-    # GET responder runs in a background thread (its own dispatcher + event loop)
     import threading
     responder_thread = threading.Thread(target=run_get_responder, daemon=True)
     responder_thread.start()
