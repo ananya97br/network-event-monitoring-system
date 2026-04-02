@@ -402,4 +402,4 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         # Handle Ctrl+C gracefully (currently incomplete log statement)
-        log.
+log.info("Shutting down node agent...")
