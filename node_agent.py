@@ -1,3 +1,23 @@
+"""
+Network Event Monitoring System - Node Agent
+
+This module runs on each monitored machine and performs three main tasks:
+
+1. Collects current system status such as CPU load, uptime, IP address,
+   and number of running processes.
+
+2. Detects important events (high CPU load, process spikes, heartbeat, etc.)
+   and securely sends them to the central monitoring server using SNMP traps.
+
+3. Responds to SNMP GET requests so the server can directly query standard
+   system information such as hostname, uptime, location, and interface count.
+
+The agent uses:
+- psutil and os modules for system monitoring
+- SNMPv2c for communication
+- Fernet encryption to protect event details
+- asyncio for non-blocking background execution
+"""
 import asyncio
 import json
 import logging
@@ -107,30 +127,74 @@ def collect_status() -> dict:
 
 # ─── SNMP trap sender ─────────────────────────────────────────────────────────
 async def send_trap(event_type: str, details: dict) -> None:
-    # Encrypt the JSON payload before sending
-    details_json      = json.dumps(details, sort_keys=True)
+    # Convert the event details dictionary into a JSON string
+    details_json = json.dumps(details, sort_keys=True)
+
+    # Encrypt the JSON string before sending for security
     encrypted_details = encrypt(details_json)
-    uptime_ticks      = int((time.time() - STARTED_AT) * 100)  # centiseconds
+
+    # Calculate how long the program has been running in centiseconds
+    # SNMP TimeTicks use 1 tick = 1/100 second
+    uptime_ticks = int((time.time() - STARTED_AT) * 100)
+
     try:
+        # Send an SNMP trap notification asynchronously
         error_indication, error_status, error_index, var_binds = await send_notification(
+
+            # Create SNMP engine object
             SnmpEngine(),
+
+            # Set SNMP community string, mpModel=1 means SNMPv2c
             CommunityData(COMMUNITY, mpModel=1),
-            await UdpTransportTarget.create((SERVER_HOST, TRAP_PORT), timeout=2, retries=1),
+
+            # Create UDP transport target using server IP and trap port
+            # timeout=2 seconds, retries=1 if sending fails
+            await UdpTransportTarget.create(
+                (SERVER_HOST, TRAP_PORT),
+                timeout=2,
+                retries=1
+            ),
+
+            # SNMP context information
             ContextData(),
+
+            # Specify that this is a trap message
             "trap",
+
+            # Build the trap packet with OID and data values
             NotificationType(ObjectIdentity(TRAP_OID)).add_varbinds(
+
+                # Standard SNMP system uptime
                 (ObjectIdentity("1.3.6.1.2.1.1.3.0"), TimeTicks(uptime_ticks)),
-                (ObjectIdentity(EVENT_TYPE_OID),       OctetString(event_type)),
-                (ObjectIdentity(EVENT_TIME_OID),       OctetString(datetime.now(timezone.utc).isoformat())),
-                (ObjectIdentity(EVENT_DETAILS_OID),    OctetString(encrypted_details)),  # encrypted
+
+                # Custom OID containing event type
+                (ObjectIdentity(EVENT_TYPE_OID), OctetString(event_type)),
+
+                # Custom OID containing current UTC timestamp
+                (ObjectIdentity(EVENT_TIME_OID),
+                 OctetString(datetime.now(timezone.utc).isoformat())),
+
+                # Custom OID containing encrypted event details
+                (ObjectIdentity(EVENT_DETAILS_OID),
+                 OctetString(encrypted_details)),
             ),
         )
+
+        # If network or transport-level error occurred
         if error_indication:
             log.error("Trap send failed (%s): %s", event_type, error_indication)
+
+        # If SNMP protocol-level error occurred
         elif error_status:
-            log.error("Trap send failed (%s): %s", event_type, error_status.prettyPrint())
+            log.error("Trap send failed (%s): %s",
+                      event_type,
+                      error_status.prettyPrint())
+
+        # Trap successfully sent
         else:
             log.info("Trap sent: %s", event_type)
+
+    # Catch any unexpected exception during sending
     except Exception as exc:
         log.exception("Trap send exception (%s): %s", event_type, exc)
 
