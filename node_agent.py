@@ -281,38 +281,73 @@ def make_get_responder():
         return wholeMsg
 
     return callback
+#------------------------------------------------------------------------------
+#Changes made by Aditya Badde
+"""
+Network Event Monitoring System - Node Agent
 
+This module runs on each monitored machine and performs three main tasks:
+
+1. Collects system status (CPU, uptime, IP, processes)
+2. Detects events and sends SNMP traps to server
+3. Responds to SNMP GET requests from server
+"""
 
 def run_get_responder():
+    # Create a new asyncio event loop (separate from main thread loop)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    # Create SNMP dispatcher (handles incoming SNMP requests)
     dispatcher = AsyncioDispatcher()
+
+    # Register UDP transport for SNMP (listens on all interfaces at STATUS_PORT)
     dispatcher.register_transport(
         udp.DOMAIN_NAME,
         udp.UdpAsyncioTransport().open_server_mode(("0.0.0.0", STATUS_PORT))
     )
+
+    # Register callback function to handle incoming SNMP GET requests
     dispatcher.register_recv_callback(make_get_responder())
+
+    # Inform dispatcher that one job has started (keeps it running)
     dispatcher.job_started(1)
+
+    # Log that SNMP GET responder is active
     log.info("GET responder listening on 0.0.0.0:%d (SNMPv2c)", STATUS_PORT)
 
     try:
+        # Start dispatcher loop (blocking call)
         dispatcher.run_dispatcher()
+
     except Exception as exc:
+        # Log any runtime error in responder
         log.error("GET responder error: %s", exc)
+
     finally:
+        # Cleanly close dispatcher when exiting
         dispatcher.close_dispatcher()
+
 
 # ─── Event monitor (traps) ────────────────────────────────────────────────────
 async def monitor_events() -> None:
+    # Collect initial system status snapshot
     previous = collect_status()
+
+    # Send startup trap when node starts
     await send_trap("nodeStartup", previous)
+
+    # Track last heartbeat timestamp
     last_heartbeat = 0.0
 
     while True:
+        # Wait for next polling interval
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+        # Get current system status
         current = collect_status()
 
+        # ── Check for load state change ──
         if current["load_state"] != previous["load_state"]:
             await send_trap("loadStateChanged", {
                 "previous_load_state": previous["load_state"],
@@ -320,6 +355,7 @@ async def monitor_events() -> None:
                 "status": current,
             })
 
+        # ── Check for process count change beyond threshold ──
         proc_delta = current["process_count"] - previous["process_count"]
         if abs(proc_delta) >= PROCESS_DELTA_THRESHOLD:
             await send_trap("processCountChanged", {
@@ -329,29 +365,41 @@ async def monitor_events() -> None:
                 "status": current,
             })
 
+        # ── Send periodic heartbeat trap ──
         now = time.time()
         if (now - last_heartbeat) >= HEARTBEAT_INTERVAL_SECONDS:
             await send_trap("heartbeat", current)
             last_heartbeat = now
 
+        # Update previous state for next iteration
         previous = current
+
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 async def main() -> None:
+    # Log startup details (trap destination + responder port)
     log.info(
         "Node agent started  |  traps -> %s:%d  |  GET responder -> 0.0.0.0:%d",
         SERVER_HOST, TRAP_PORT, STATUS_PORT,
     )
 
     import threading
+
+    # Run SNMP GET responder in a separate daemon thread
+    # (because dispatcher.run_dispatcher() is blocking)
     responder_thread = threading.Thread(target=run_get_responder, daemon=True)
     responder_thread.start()
 
+    # Start monitoring system events asynchronously
     await monitor_events()
 
 
+# ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
+        # Start asyncio event loop and run main function
         asyncio.run(main())
+
     except KeyboardInterrupt:
-        log.info("Node agent stopped")
+        # Handle Ctrl+C gracefully (currently incomplete log statement)
+        log.
