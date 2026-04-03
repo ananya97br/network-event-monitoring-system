@@ -399,7 +399,6 @@ if __name__ == "__main__":
     try:
         # Start asyncio event loop and run main function
         asyncio.run(main())
-
     except KeyboardInterrupt:
-        # Handle Ctrl+C gracefully (currently incomplete log statement)
-log.
+        # Handle Ctrl+C gracefully
+        log.info("Node agent stopped")
