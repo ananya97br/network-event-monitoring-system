@@ -13,6 +13,7 @@ import threading
 import asyncio
 import os
 import json
+import time
 from collections import defaultdict
 from datetime import datetime
 
@@ -28,7 +29,6 @@ logging.basicConfig(
 log = logging.getLogger("traps")
 
 # ─── Symmetric encryption (Fernet / AES-128) ─────────────────────────────────
-# Must match the key in node_agent.py exactly.
 FERNET_KEY = b"x81EKjn14CbZmChtM_G1A0zFprkP7CGi_OcEX32ZBxw="
 _fernet = Fernet(FERNET_KEY)
 
@@ -73,7 +73,7 @@ TRAP_OID_TO_TYPE = {
     "1.3.6.1.6.3.1.1.5.6": "egpNeighborLoss",
 }
 
-# ─── Shared state (thread-safe via lock) ─────────────────────────────────────
+# ─── Shared state ─────────────────────────────────────────────────────────────
 trap_lock = threading.Lock()
 all_traps: list[dict] = []
 traps_by_node: dict[str, list[dict]] = defaultdict(list)
@@ -85,7 +85,7 @@ def store_trap(trap: dict):
         traps_by_node[trap["agent"]].append(trap)
 
 
-# ─── SNMP GET (port 5161) ─────────────────────────────────────────────────────
+# ─── SNMP GET with retries ────────────────────────────────────────────────────
 STATUS_OIDS_MIB = [
     ("SNMPv2-MIB", "sysDescr",    0),
     ("SNMPv2-MIB", "sysName",     0),
@@ -95,60 +95,93 @@ STATUS_OIDS_MIB = [
 ]
 
 STATUS_OIDS_ENTERPRISE = [
-    "1.3.6.1.4.1.53864.1.1",   # event / trap type string
-    "1.3.6.1.4.1.53864.1.2",   # ISO timestamp from agent
-    "1.3.6.1.4.1.53864.1.3",   # encrypted JSON payload
+    "1.3.6.1.4.1.53864.1.1",
+    "1.3.6.1.4.1.53864.1.2",
+    "1.3.6.1.4.1.53864.1.3",
 ]
+
+GET_TIMEOUT = 2
+GET_RETRIES = 3
 
 
 def snmp_get_status(host: str, community: str = "public", port: int = 5161) -> dict:
     async def _do_get():
         results: dict[str, str] = {}
-        engine    = SnmpEngine()
-        auth      = CommunityData(community, mpModel=1)
-        transport = await UdpTransportTarget.create(
-            (host, port), timeout=2, retries=1
-        )
+        engine = SnmpEngine()
+        auth   = CommunityData(community, mpModel=1)
+
+        for attempt in range(1, GET_RETRIES + 1):
+            try:
+                transport = await UdpTransportTarget.create(
+                    (host, port), timeout=GET_TIMEOUT, retries=1
+                )
+                break
+            except Exception as exc:
+                log.warning("GET transport create attempt %d/%d failed: %s",
+                            attempt, GET_RETRIES, exc)
+                if attempt == GET_RETRIES:
+                    log.error("All GET transport attempts failed for %s", host)
+                    return {"error": f"Cannot reach {host}:{port} after {GET_RETRIES} attempts"}
+                await asyncio.sleep(1)
 
         for mib, sym, idx in STATUS_OIDS_MIB:
-            try:
-                err_ind, err_status, err_idx, var_binds = await get_cmd(
-                    engine, auth, transport, ContextData(),
-                    ObjectType(ObjectIdentity(mib, sym, idx)),
-                )
-                key = f"{mib}::{sym}.{idx}"
-                if err_ind:
-                    results[key] = f"ERROR: {err_ind}"
-                elif err_status:
-                    at = err_idx and var_binds[int(err_idx) - 1][0] or "?"
-                    results[key] = f"ERROR: {err_status.prettyPrint()} at {at}"
-                else:
-                    for oid, val in var_binds:
-                        results[resolve_oid(oid.prettyPrint())] = val.prettyPrint()
-            except Exception as exc:
-                results[f"{mib}::{sym}.{idx}"] = f"EXCEPTION: {exc}"
+            for attempt in range(1, GET_RETRIES + 1):
+                try:
+                    err_ind, err_status, err_idx, var_binds = await get_cmd(
+                        engine, auth, transport, ContextData(),
+                        ObjectType(ObjectIdentity(mib, sym, idx)),
+                    )
+                    key = f"{mib}::{sym}.{idx}"
+                    if err_ind:
+                        if attempt < GET_RETRIES:
+                            log.warning("GET %s attempt %d failed (%s), retrying...",
+                                        key, attempt, err_ind)
+                            await asyncio.sleep(0.5)
+                            continue
+                        results[key] = f"ERROR: {err_ind}"
+                    elif err_status:
+                        at = err_idx and var_binds[int(err_idx) - 1][0] or "?"
+                        results[key] = f"ERROR: {err_status.prettyPrint()} at {at}"
+                    else:
+                        for oid, val in var_binds:
+                            results[resolve_oid(oid.prettyPrint())] = val.prettyPrint()
+                    break
+                except Exception as exc:
+                    if attempt < GET_RETRIES:
+                        log.warning("GET %s::%s attempt %d exception: %s, retrying...",
+                                    mib, sym, attempt, exc)
+                        await asyncio.sleep(0.5)
+                    else:
+                        results[f"{mib}::{sym}.{idx}"] = f"EXCEPTION: {exc}"
 
         for raw_oid in STATUS_OIDS_ENTERPRISE:
             label = resolve_oid(raw_oid)
-            try:
-                err_ind, err_status, err_idx, var_binds = await get_cmd(
-                    engine, auth, transport, ContextData(),
-                    ObjectType(ObjectIdentity(raw_oid)),
-                )
-                if err_ind:
-                    results[label] = f"ERROR: {err_ind}"
-                elif err_status:
-                    results[label] = f"ERROR: {err_status.prettyPrint()}"
-                else:
-                    for oid, val in var_binds:
-                        resolved = resolve_oid(oid.prettyPrint())
-                        raw_val  = val.prettyPrint()
-                        # Decrypt the JSON metrics payload
-                        if "53864.1.3" in oid.prettyPrint():
-                            raw_val = decrypt(raw_val)
-                        results[resolved] = raw_val
-            except Exception as exc:
-                results[label] = f"EXCEPTION: {exc}"
+            for attempt in range(1, GET_RETRIES + 1):
+                try:
+                    err_ind, err_status, _, var_binds = await get_cmd(
+                        engine, auth, transport, ContextData(),
+                        ObjectType(ObjectIdentity(raw_oid)),
+                    )
+                    if err_ind:
+                        if attempt < GET_RETRIES:
+                            await asyncio.sleep(0.5)
+                            continue
+                        results[label] = f"ERROR: {err_ind}"
+                    elif err_status:
+                        results[label] = f"ERROR: {err_status.prettyPrint()}"
+                    else:
+                        for oid, val in var_binds:
+                            resolved = resolve_oid(oid.prettyPrint())
+                            raw_val  = val.prettyPrint()
+                            if "53864.1.3" in oid.prettyPrint():
+                                raw_val = decrypt(raw_val)
+                            results[resolved] = raw_val
+                    break
+                except Exception as exc:
+                    if attempt < GET_RETRIES:
+                        await asyncio.sleep(0.5)
+                    else:
+                        results[label] = f"EXCEPTION: {exc}"
 
         engine.close_dispatcher()
         return results
@@ -161,20 +194,26 @@ def snmp_get_status(host: str, community: str = "public", port: int = 5161) -> d
 
 
 def display_node_status():
-    host      = input("\n  Enter node IP address : ").strip()
+    host = input("\n  Enter node IP address : ").strip()
+    if not host:
+        print("  [No address entered]\n")
+        return
     community = input("  Community string [public]: ").strip() or "public"
 
     print(f"\n  Sending GET to agent {host}:5161 ...")
-
+    t0 = time.monotonic()
     results = snmp_get_status(host, community, 5161)
+    elapsed_ms = round((time.monotonic() - t0) * 1000)
 
     print(f"\n  {'=' * 54}")
     print(f"  Node Status  —  {host}")
     print(f"  {'=' * 54}")
 
-    if not results:
-        print("  [No GET-Response received from agent]\n")
+    if "error" in results:
+        print(f"  Error: {results['error']}\n")
         return
+
+    print(f"  GET round-trip latency : {elapsed_ms} ms")
 
     enterprise_json_key = next(
         (k for k in results if "53864.1.3" in k), None
@@ -199,7 +238,7 @@ def display_node_status():
     print(f"  {'-' * 54}\n")
 
 
-# ─── SNMP trap callback (SNMPv2c only, port 5162) ────────────────────────────
+# ─── SNMP trap callback ───────────────────────────────────────────────────────
 def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
     while wholeMsg:
         msgVer = int(api.decodeMessageVersion(wholeMsg))
@@ -213,9 +252,9 @@ def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
         reqPDU = pMod.apiMessage.get_pdu(reqMsg)
 
         if not reqPDU.isSameTypeWith(pMod.TrapPDU()):
-            return
+            break
 
-        agent      = transportAddress[0]
+        agent = transportAddress[0]
         varbinds: dict[str, str] = {}
         trap_oid: str | None     = None
         event_type: str | None   = None
@@ -224,12 +263,12 @@ def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
             oid_str = oid.prettyPrint()
             val_str = val.prettyPrint()
 
-            if oid_str == "1.3.6.1.6.3.1.1.4.1.0":       # snmpTrapOID
+            if oid_str == "1.3.6.1.6.3.1.1.4.1.0":
                 trap_oid   = val_str
                 event_type = TRAP_OID_TO_TYPE.get(val_str)
-            elif oid_str == "1.3.6.1.4.1.53864.1.1":      # enterprise event type
+            elif oid_str == "1.3.6.1.4.1.53864.1.1":
                 event_type = val_str
-            elif oid_str == "1.3.6.1.4.1.53864.1.3":      # encrypted JSON payload
+            elif oid_str == "1.3.6.1.4.1.53864.1.3":
                 val_str = decrypt(val_str)
                 varbinds[resolve_oid(oid_str)] = val_str
             else:
@@ -238,7 +277,6 @@ def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
         trap = {
             "ts":         datetime.now().isoformat(),
             "agent":      agent,
-            "version":    "SNMPv2c",
             "trap_type":  event_type or (TRAP_OID_TO_TYPE.get(trap_oid) if trap_oid else None) or "unknown",
             "trap_oid":   trap_oid,
             "enterprise": resolve_oid("1.3.6.1.4.1.53864.1.0"),
@@ -251,7 +289,7 @@ def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
     return wholeMsg
 
 
-# ─── Background dispatcher thread (port 5162) ────────────────────────────────
+# ─── Background dispatcher thread ────────────────────────────────────────────
 def run_dispatcher():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -275,7 +313,7 @@ def run_dispatcher():
 
 # ─── Display helpers ──────────────────────────────────────────────────────────
 def print_trap(trap: dict):
-    print(f"\n  Timestamp : {trap.get('ts', trap.get('timestamp', 'N/A'))}")
+    print(f"\n  Timestamp : {trap.get('ts', 'N/A')}")
     print(f"  Agent     : {trap['agent']}")
     print(f"  Trap Type : {trap.get('trap_type', 'unknown')}")
     varbinds = {k: v for k, v in trap.get("varbinds", {}).items() if "sysUpTime" not in k}
@@ -341,10 +379,6 @@ def display_node_history():
 
 # ─── JSON log parser ──────────────────────────────────────────────────────────
 def load_traps_from_log(log_path: str = "traps.log") -> int:
-    """
-    Traps are already decrypted before being stored, so the log contains
-    plaintext JSON — no decryption needed here.
-    """
     if not os.path.exists(log_path):
         return 0
 
@@ -375,17 +409,17 @@ def main():
 
     listener = threading.Thread(target=run_dispatcher, daemon=True)
     listener.start()
-    print("  SNMP Trap Listener running in background")
+    print("  SNMP Trap Listener running on port 5162")
 
     while True:
-        print("\n  ┌──────────────────────────────────┐")
-        print("  │              MENU                │")
-        print("  ├──────────────────────────────────┤")
-        print("  │  1. Display all traps            │")
-        print("  │  2. Trap history by node         │")
-        print("  │  3. Get current status of node   │")
-        print("  │  4. Exit                         │")
-        print("  └──────────────────────────────────┘")
+        print("\n  ┌──────────────────────────────────────┐")
+        print("  │                MENU                  │")
+        print("  ├──────────────────────────────────────┤")
+        print("  │  1. Display all traps                │")
+        print("  │  2. Trap history by node             │")
+        print("  │  3. Get current status of node       │")
+        print("  │  4. Exit                             │")
+        print("  └──────────────────────────────────────┘")
         try:
             choice = input("  Select option [1-4]: ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -402,7 +436,7 @@ def main():
             print("\n  Shutting down...\n")
             break
         else:
-            print("\n  Invalid option. Please enter 1, 2, 3, or 4.\n")
+            print("\n  Invalid option. Please enter 1-4.\n")
 
 
 if __name__ == "__main__":

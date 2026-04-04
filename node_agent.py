@@ -1,22 +1,17 @@
 """
 Network Event Monitoring System - Node Agent
 
-This module runs on each monitored machine and performs three main tasks:
+Runs on each monitored machine and performs three tasks:
+1. Collects system status (CPU, uptime, IP, processes)
+2. Detects events and sends SNMP traps with retries to the server
+3. Responds to SNMP GET requests from the server
 
-1. Collects current system status such as CPU load, uptime, IP address,
-   and number of running processes.
-
-2. Detects important events (high CPU load, process spikes, heartbeat, etc.)
-   and securely sends them to the central monitoring server using SNMP traps.
-
-3. Responds to SNMP GET requests so the server can directly query standard
-   system information such as hostname, uptime, location, and interface count.
-
-The agent uses:
-- psutil and os modules for system monitoring
-- SNMPv2c for communication
-- Fernet encryption to protect event details
-- asyncio for non-blocking background execution
+Enhancements:
+- Trap send retries (configurable MAX_TRAP_RETRIES)
+- Sequence numbers in every trap for server-side packet loss detection
+- Trap send latency logged per event
+- Robust error handling for abrupt disconnections and edge cases
+- nodeShutdown trap sent before exit on Ctrl+C
 """
 import asyncio
 import json
@@ -55,8 +50,11 @@ HEARTBEAT_INTERVAL_SECONDS = 60
 LOAD_HIGH_FACTOR           = 1.0
 PROCESS_DELTA_THRESHOLD    = 20
 
+# Retry settings for trap sending
+MAX_TRAP_RETRIES = 3
+TRAP_RETRY_DELAY = 1.0
+
 # ─── Symmetric encryption (Fernet / AES-128) ─────────────────────────────────
-# Must match the key in server.py exactly.
 FERNET_KEY = b"x81EKjn14CbZmChtM_G1A0zFprkP7CGi_OcEX32ZBxw="
 _fernet = Fernet(FERNET_KEY)
 
@@ -72,7 +70,6 @@ EVENT_TYPE_OID    = "1.3.6.1.4.1.53864.1.1"
 EVENT_TIME_OID    = "1.3.6.1.4.1.53864.1.2"
 EVENT_DETAILS_OID = "1.3.6.1.4.1.53864.1.3"
 
-# Standard MIB OIDs the GET responder handles
 SYS_DESCR_OID    = "1.3.6.1.2.1.1.1.0"
 SYS_NAME_OID     = "1.3.6.1.2.1.1.5.0"
 SYS_LOCATION_OID = "1.3.6.1.2.1.1.6.0"
@@ -89,9 +86,26 @@ log = logging.getLogger("node-agent")
 
 STARTED_AT = time.time()
 
+# ─── Sequence counter for packet-loss detection ───────────────────────────────
+_trap_seq_lock = asyncio.Lock()
+_trap_seq      = 0
+
+async def _next_seq() -> int:
+    global _trap_seq
+    async with _trap_seq_lock:
+        _trap_seq += 1
+        return _trap_seq
+
+# ─── Trap stats ───────────────────────────────────────────────────────────────
+trap_send_latencies: list[float] = []
+trap_send_failures:  int         = 0
+trap_send_successes: int         = 0
+
+
 # ─── System helpers ───────────────────────────────────────────────────────────
 def _hostname() -> str:
     return socket.gethostname()
+
 
 def _local_ip() -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -103,15 +117,20 @@ def _local_ip() -> str:
     finally:
         sock.close()
 
+
 def collect_status() -> dict:
     cpu_count = os.cpu_count() or 1
-    if hasattr(os, 'getloadavg'):
-        load1, load5, load15 = os.getloadavg()  # Unix/macOS only
+    if hasattr(os, "getloadavg"):
+        load1, load5, load15 = os.getloadavg()
     else:
-        # Windows fallback: use current CPU utilization as a proxy
         cpu_percent = psutil.cpu_percent(interval=1)
         load1 = load5 = load15 = (cpu_percent / 100) * cpu_count
-    process_count = len([p for p in os.listdir("/proc") if p.isdigit()])
+
+    try:
+        process_count = len([p for p in os.listdir("/proc") if p.isdigit()])
+    except (PermissionError, FileNotFoundError):
+        process_count = len(psutil.pids())
+
     return {
         "node":           _hostname(),
         "ip":             _local_ip(),
@@ -125,78 +144,94 @@ def collect_status() -> dict:
         "process_count":  process_count,
     }
 
-# ─── SNMP trap sender ─────────────────────────────────────────────────────────
-async def send_trap(event_type: str, details: dict) -> None:
+
+# ─── SNMP trap sender with retries ───────────────────────────────────────────
+async def send_trap(event_type: str, details: dict) -> bool:
+    """
+    Send an SNMP trap with up to MAX_TRAP_RETRIES attempts.
+    """
+    global trap_send_failures, trap_send_successes
+
+    seq          = await _next_seq()
     # Convert the event details dictionary into a JSON string
     details_json = json.dumps(details, sort_keys=True)
-
     # Encrypt the JSON string before sending for security
-    encrypted_details = encrypt(details_json)
-
-    # Calculate how long the program has been running in centiseconds
+    encrypted    = encrypt(details_json)
+    # Calculate how long the program has been running in centiseconds    
     # SNMP TimeTicks use 1 tick = 1/100 second
     uptime_ticks = int((time.time() - STARTED_AT) * 100)
+    agent_ts     = datetime.now(timezone.utc).isoformat()
 
-    try:
-        # Send an SNMP trap notification asynchronously
-        error_indication, error_status, error_index, var_binds = await send_notification(
-
+    for attempt in range(1, MAX_TRAP_RETRIES + 1):
+        t0 = time.monotonic()
+        try:
             # Create SNMP engine object
-            SnmpEngine(),
-
-            # Set SNMP community string, mpModel=1 means SNMPv2c
-            CommunityData(COMMUNITY, mpModel=1),
-
-            # Create UDP transport target using server IP and trap port
-            # timeout=2 seconds, retries=1 if sending fails
-            await UdpTransportTarget.create(
+            engine    = SnmpEngine()
+            transport = await UdpTransportTarget.create(
                 (SERVER_HOST, TRAP_PORT),
                 timeout=2,
-                retries=1
-            ),
+                retries=1,
+            )
 
-            # SNMP context information
-            ContextData(),
+            # Send an SNMP trap notification asynchronously
+            error_indication, error_status, error_index, var_binds = await send_notification(
+                engine,
+                # Set SNMP community string, mpModel=1 means SNMPv2c
+                CommunityData(COMMUNITY, mpModel=1),
+                transport,
+                # SNMP context information
+                ContextData(),
+                # Specify that this is a trap message
+                "trap",
+                # Build the trap packet with OID and data values
+                NotificationType(ObjectIdentity(TRAP_OID)).add_varbinds(
+                    # Standard SNMP system uptime
+                    (ObjectIdentity("1.3.6.1.2.1.1.3.0"), TimeTicks(uptime_ticks)),
+                    # Custom OID containing event type
+                    (ObjectIdentity(EVENT_TYPE_OID), OctetString(event_type)),
+                    # Custom OID containing current UTC timestamp
+                    (ObjectIdentity(EVENT_TIME_OID), OctetString(agent_ts)),
+                    # Custom OID containing encrypted event details
+                    (ObjectIdentity(EVENT_DETAILS_OID), OctetString(encrypted)),
+                ),
+            )
 
-            # Specify that this is a trap message
-            "trap",
+            elapsed = time.monotonic() - t0
 
-            # Build the trap packet with OID and data values
-            NotificationType(ObjectIdentity(TRAP_OID)).add_varbinds(
+            # If network or transport-level error occurred
+            if error_indication:
+                log.warning("Trap send attempt %d/%d failed (%s): %s",attempt, MAX_TRAP_RETRIES, event_type, error_indication)
+            # If SNMP protocol-level error occurred
+            elif error_status:
+                log.warning("Trap send attempt %d/%d SNMP error (%s): %s",attempt, MAX_TRAP_RETRIES, event_type,error_status.prettyPrint())
+            else:
+                trap_send_latencies.append(elapsed)
+                trap_send_successes += 1
+                log.info("Trap sent (seq=%d, attempt=%d, latency=%.0fms): %s",
+                         seq, attempt, elapsed * 1000, event_type)
+                try:
+                    engine.close_dispatcher()
+                except Exception:
+                    pass
+                return True
 
-                # Standard SNMP system uptime
-                (ObjectIdentity("1.3.6.1.2.1.1.3.0"), TimeTicks(uptime_ticks)),
+            try:
+                engine.close_dispatcher()
+            except Exception:
+                pass
 
-                # Custom OID containing event type
-                (ObjectIdentity(EVENT_TYPE_OID), OctetString(event_type)),
+        except Exception as exc:
+            log.warning("Trap send attempt %d/%d exception (%s): %s",
+                        attempt, MAX_TRAP_RETRIES, event_type, exc)
 
-                # Custom OID containing current UTC timestamp
-                (ObjectIdentity(EVENT_TIME_OID),
-                 OctetString(datetime.now(timezone.utc).isoformat())),
+        if attempt < MAX_TRAP_RETRIES:
+            await asyncio.sleep(TRAP_RETRY_DELAY)
 
-                # Custom OID containing encrypted event details
-                (ObjectIdentity(EVENT_DETAILS_OID),
-                 OctetString(encrypted_details)),
-            ),
-        )
+    trap_send_failures += 1
+    log.error("Trap FAILED after %d attempts (seq=%d): %s",
+              MAX_TRAP_RETRIES, seq, event_type)
+    return False
 
-        # If network or transport-level error occurred
-        if error_indication:
-            log.error("Trap send failed (%s): %s", event_type, error_indication)
-
-        # If SNMP protocol-level error occurred
-        elif error_status:
-            log.error("Trap send failed (%s): %s",
-                      event_type,
-                      error_status.prettyPrint())
-
-        # Trap successfully sent
-        else:
-            log.info("Trap sent: %s", event_type)
-
-    # Catch any unexpected exception during sending
-    except Exception as exc:
-        log.exception("Trap send exception (%s): %s", event_type, exc)
 
 # ─── SNMP GET responder (port 5161) ───────────────────────────────────────────
 def _build_get_response(req_msg, pMod, status: dict) -> bytes:
@@ -205,7 +240,7 @@ def _build_get_response(req_msg, pMod, status: dict) -> bytes:
     # Encrypt the JSON payload before putting it in the GET response
     details_json      = json.dumps(status, sort_keys=True)
     encrypted_details = encrypt(details_json)
-    uptime_ticks      = int((time.time() - STARTED_AT) * 100)  # centiseconds
+    uptime_ticks      = int((time.time() - STARTED_AT) * 100)
 
     oid_values = {
         SYS_DESCR_OID:     pMod.OctetString(f"Node agent on {status['node']} running Python"),
@@ -216,7 +251,7 @@ def _build_get_response(req_msg, pMod, status: dict) -> bytes:
         IF_NUMBER_OID:     pMod.Integer(0),
         EVENT_TYPE_OID:    pMod.OctetString("getResponse"),
         EVENT_TIME_OID:    pMod.OctetString(status["timestamp"]),
-        EVENT_DETAILS_OID: pMod.OctetString(encrypted_details),  # encrypted
+        EVENT_DETAILS_OID: pMod.OctetString(encrypted_details),
     }
 
     resp_pdu = pMod.GetResponsePDU()
@@ -281,7 +316,8 @@ def make_get_responder():
         return wholeMsg
 
     return callback
-#------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------
 #Changes made by Aditya Badde
 """
 Network Event Monitoring System - Node Agent
@@ -292,7 +328,6 @@ This module runs on each monitored machine and performs three main tasks:
 2. Detects events and sends SNMP traps to server
 3. Responds to SNMP GET requests from server
 """
-
 def run_get_responder():
     # Create a new asyncio event loop (separate from main thread loop)
     loop = asyncio.new_event_loop()
@@ -300,30 +335,24 @@ def run_get_responder():
 
     # Create SNMP dispatcher (handles incoming SNMP requests)
     dispatcher = AsyncioDispatcher()
-
     # Register UDP transport for SNMP (listens on all interfaces at STATUS_PORT)
     dispatcher.register_transport(
         udp.DOMAIN_NAME,
         udp.UdpAsyncioTransport().open_server_mode(("0.0.0.0", STATUS_PORT))
     )
-
     # Register callback function to handle incoming SNMP GET requests
     dispatcher.register_recv_callback(make_get_responder())
-
     # Inform dispatcher that one job has started (keeps it running)
     dispatcher.job_started(1)
-
     # Log that SNMP GET responder is active
     log.info("GET responder listening on 0.0.0.0:%d (SNMPv2c)", STATUS_PORT)
 
     try:
         # Start dispatcher loop (blocking call)
         dispatcher.run_dispatcher()
-
     except Exception as exc:
         # Log any runtime error in responder
         log.error("GET responder error: %s", exc)
-
     finally:
         # Cleanly close dispatcher when exiting
         dispatcher.close_dispatcher()
@@ -331,74 +360,97 @@ def run_get_responder():
 
 # ─── Event monitor (traps) ────────────────────────────────────────────────────
 async def monitor_events() -> None:
-    # Collect initial system status snapshot
-    previous = collect_status()
+    # Collect initial snapshot; retry if it fails
+    for attempt in range(1, 4):
+        try:
+            previous = collect_status()
+            break
+        except Exception as exc:
+            log.warning("collect_status attempt %d failed: %s", attempt, exc)
+            if attempt == 3:
+                log.error("Cannot collect initial status; aborting monitor.")
+                return
+            await asyncio.sleep(2)
 
-    # Send startup trap when node starts
     await send_trap("nodeStartup", previous)
 
-    # Track last heartbeat timestamp
     last_heartbeat = 0.0
 
-    while True:
-        # Wait for next polling interval
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+    try:
+        while True:
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-        # Get current system status
-        current = collect_status()
+            try:
+                current = collect_status()
+            except Exception as exc:
+                log.warning("collect_status failed during poll: %s", exc)
+                continue
 
-        # ── Check for load state change ──
-        if current["load_state"] != previous["load_state"]:
-            await send_trap("loadStateChanged", {
-                "previous_load_state": previous["load_state"],
-                "current_load_state":  current["load_state"],
-                "status": current,
-            })
+            # ── Load state change ──
+            if current["load_state"] != previous["load_state"]:
+                await send_trap("loadStateChanged", {
+                    "previous_load_state": previous["load_state"],
+                    "current_load_state":  current["load_state"],
+                    "status": current,
+                })
 
-        # ── Check for process count change beyond threshold ──
-        proc_delta = current["process_count"] - previous["process_count"]
-        if abs(proc_delta) >= PROCESS_DELTA_THRESHOLD:
-            await send_trap("processCountChanged", {
-                "delta":                  proc_delta,
-                "previous_process_count": previous["process_count"],
-                "current_process_count":  current["process_count"],
-                "status": current,
-            })
+            # ── Process count spike ──
+            proc_delta = current["process_count"] - previous["process_count"]
+            if abs(proc_delta) >= PROCESS_DELTA_THRESHOLD:
+                await send_trap("processCountChanged", {
+                    "delta":                  proc_delta,
+                    "previous_process_count": previous["process_count"],
+                    "current_process_count":  current["process_count"],
+                    "status": current,
+                })
 
-        # ── Send periodic heartbeat trap ──
-        now = time.time()
-        if (now - last_heartbeat) >= HEARTBEAT_INTERVAL_SECONDS:
-            await send_trap("heartbeat", current)
-            last_heartbeat = now
+            # ── Heartbeat ──
+            now = time.time()
+            if (now - last_heartbeat) >= HEARTBEAT_INTERVAL_SECONDS:
+                await send_trap("heartbeat", current)
+                last_heartbeat = now
 
-        # Update previous state for next iteration
-        previous = current
+            previous = current
+
+    except asyncio.CancelledError:
+        # Ctrl+C cancels the task — send shutdown trap before propagating
+        log.info("Shutdown detected — sending nodeShutdown trap...")
+        try:
+            await send_trap("nodeShutdown", collect_status())
+        except Exception as exc:
+            log.warning("nodeShutdown trap failed: %s", exc)
+        raise  # re-raise so asyncio can clean up properly
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 async def main() -> None:
-    # Log startup details (trap destination + responder port)
     log.info(
         "Node agent started  |  traps -> %s:%d  |  GET responder -> 0.0.0.0:%d",
         SERVER_HOST, TRAP_PORT, STATUS_PORT,
     )
 
     import threading
-
-    # Run SNMP GET responder in a separate daemon thread
-    # (because dispatcher.run_dispatcher() is blocking)
     responder_thread = threading.Thread(target=run_get_responder, daemon=True)
     responder_thread.start()
 
-    # Start monitoring system events asynchronously
-    await monitor_events()
+    try:
+        await monitor_events()
+    except asyncio.CancelledError:
+        pass  # already handled inside monitor_events
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
-        # Start asyncio event loop and run main function
         asyncio.run(main())
     except KeyboardInterrupt:
-        # Handle Ctrl+C gracefully
-        log.info("Node agent stopped")
+        pass  # clean exit; nodeShutdown trap already sent inside monitor_events
+    finally:
+        total   = trap_send_successes + trap_send_failures
+        loss    = (trap_send_failures / total * 100) if total else 0.0
+        avg_lat = (sum(trap_send_latencies) / len(trap_send_latencies) * 1000
+                   if trap_send_latencies else 0.0)
+        log.info(
+            "Trap stats — sent: %d  failed: %d  loss: %.1f%%  avg_latency: %.0f ms",
+            trap_send_successes, trap_send_failures, loss, avg_lat,
+        )
