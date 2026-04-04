@@ -287,6 +287,7 @@ dependencies = [
     { name = "psutil" },
     { name = "pysmi" },
     { name = "pysnmp" },
+    { name = "pysnmp-mibs" },
     { name = "snmpsim" },
 ]
 
@@ -296,6 +297,7 @@ requires-dist = [
     { name = "psutil", specifier = ">=7.2.2" },
     { name = "pysmi", specifier = ">=1.6.3" },
     { name = "pysnmp", specifier = ">=7.1.22" },
+    { name = "pysnmp-mibs", specifier = ">=0.1.6" },
     { name = "snmpsim", specifier = ">=1.2.1" },
 ]
 
@@ -378,6 +380,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c5/f7/63a4833b675f3f85296d85f2fddaed93d76799f29a813a2d5ca2bbe7fc50/pysnmp-7.1.22.tar.gz", hash = "sha256:37ac595c7f0c1c00514505939b4dcf5b4fd5a9ffe51b0349f60bb640c11b0f77", size = 259230, upload-time = "2025-10-26T22:09:56.413Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/25/da/9b6bc9517f6a69d03b70f43c4cfd1cca6289fdccabcf648204f2b0c6bc9b/pysnmp-7.1.22-py3-none-any.whl", hash = "sha256:57e704a6ba2bbf571d16cd5dc08b89bb3fa0ebeb5f4f26b87fececad3b3de7a6", size = 343380, upload-time = "2025-10-26T22:09:54.816Z" },
+]
+
+[[package]]
+name = "pysnmp-mibs"
+version = "0.1.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pysnmp" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/bf/7c/99ab192af934ed5d41ceef92a1b949b41652f29b46241b902ffec55642f4/pysnmp-mibs-0.1.6.tar.gz", hash = "sha256:00fa321ca598e8a14c0ad98702bf10fb5e9d57b7d06bb99dc818fea07683720c", size = 2113334, upload-time = "2016-02-13T23:55:21.888Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c5/33/4ce8b8cc60c871348ccd3d784415cb6b357d91ca158b63ef5c3e6f96bfe0/pysnmp_mibs-0.1.6-py2.py3-none-any.whl", hash = "sha256:5e153ebe8e767c07940cea435f866c623ff6b2376155c7da75085b08d3774d48", size = 2316964, upload-time = "2016-02-13T23:54:59.491Z" },
 ]
 
 [[package]]

@@ -9,5 +9,6 @@ dependencies = [
     "psutil>=7.2.2",
     "pysmi>=1.6.3",
     "pysnmp>=7.1.22",
+    "pysnmp-mibs>=0.1.6",
     "snmpsim>=1.2.1",
 ]
