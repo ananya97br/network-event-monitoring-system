@@ -356,7 +356,7 @@ def display_all_traps():
                 last_seen = current_len
             stop_event.wait(timeout=1)
 
-    watcher = threading.Thread(target=watch, daemon=True)
+    watcher = threading.Thread(target=watch, daemon=True) # daemon thread to watch for new traps without blocking main thread
     watcher.start()
     try:
         input()
