@@ -17,53 +17,52 @@ import time
 from collections import defaultdict
 from datetime import datetime
 
-# ─── Logging setup ────────────────────────────────────────────────────────────
-_file_handler = logging.FileHandler("traps.log")
-_file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-
+# ----------------------------- Logging setup ----------------------------------------------------------
+file_handler = logging.FileHandler("traps.log") #Creates a file handler to write logs to "traps.log"
+file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))  # Sets log format: timestamp, log level, message for this handler
+#Configures logging system to INFO level with the file handler for the whole application (default format for the entire application)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[_file_handler],
+    handlers=[file_handler],
 )
-log = logging.getLogger("traps")
+log = logging.getLogger("traps")  # Initializes a logger instance named "traps"
 
-# ─── Symmetric encryption (Fernet / AES-128) ─────────────────────────────────
+# ----------------------- Symmetric encryption (Fernet / AES-128) ---------------------------------------
 FERNET_KEY = b"x81EKjn14CbZmChtM_G1A0zFprkP7CGi_OcEX32ZBxw="
-_fernet = Fernet(FERNET_KEY)
+fernet = Fernet(FERNET_KEY) # Initializes a Fernet instance with the provided key for encryption and decryption operations
 
 
 def decrypt(ciphertext: str) -> str:
     """Decrypt a Fernet ciphertext string → UTF-8 plaintext. Returns raw value on failure."""
     try:
-        return _fernet.decrypt(ciphertext.encode()).decode()
+        return fernet.decrypt(ciphertext.encode()).decode()  # encode string to bytes, decrypt, decode back to string
     except InvalidToken:
-        log.warning("Decryption failed — wrong key or tampered data")
+        log.warning("Decryption failed — wrong key or tampered data")   # If decryption fails, log warning and return original ciphertext
         return ciphertext
 
 
-# ─── MIB / OID resolution setup ──────────────────────────────────────────────
-_mib_builder = builder.MibBuilder()
-compiler.add_mib_compiler(_mib_builder, sources=["https://mibs.pysnmp.com/asn1/@mib@"])
-_mib_builder.load_modules(
+# ---------------------- MIB / OID resolution setup -------------------------------------------------------
+mib_builder = builder.MibBuilder() # Initializes a MIB builder instance to manage MIB modules 
+compiler.add_mib_compiler(mib_builder, sources=["https://mibs.pysnmp.com/asn1/@mib@"]) # Adds a MIB compiler that can download MIB files from the web source
+# Loads standard MIB modules for translating numeric OIDs to names
+mib_builder.load_modules(
     "SNMPv2-MIB", "SNMPv2-SMI", "SNMPv2-TC",
     "IF-MIB", "IP-MIB", "TCP-MIB", "UDP-MIB",
     "HOST-RESOURCES-MIB", "ENTITY-MIB",
 )
-_mib_view = view.MibViewController(_mib_builder)
-
+mib_view = view.MibViewController(mib_builder) # Enables lookup of MIB objects within the loaded modules---queries are made
 
 def resolve_oid(oid_str: str) -> str:
     try:
         oid_obj = rfc1902.ObjectName(oid_str)
-        mod_name, sym_name, suffix = _mib_view.get_node_location(oid_obj)
+        mod_name, sym_name, suffix = mib_view.get_node_location(oid_obj)  #  searches loaded MIBs 
         suffix_str = ("." + ".".join(str(x) for x in suffix)) if suffix else ""
         return f"{mod_name}::{sym_name}{suffix_str}"
     except Exception:
         return oid_str
 
 
-# ─── SNMPv2c trap OID → type name ────────────────────────────────────────────
 TRAP_OID_TO_TYPE = {
     "1.3.6.1.6.3.1.1.5.1": "coldStart",
     "1.3.6.1.6.3.1.1.5.2": "warmStart",
@@ -73,7 +72,7 @@ TRAP_OID_TO_TYPE = {
     "1.3.6.1.6.3.1.1.5.6": "egpNeighborLoss",
 }
 
-# ─── Shared state ─────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------------------
 trap_lock = threading.Lock()
 all_traps: list[dict] = []
 traps_by_node: dict[str, list[dict]] = defaultdict(list)
@@ -85,7 +84,7 @@ def store_trap(trap: dict):
         traps_by_node[trap["agent"]].append(trap)
 
 
-# ─── SNMP GET with retries ────────────────────────────────────────────────────
+# ----------------- SNMP GET with retries --------------------------------------------
 STATUS_OIDS_MIB = [
     ("SNMPv2-MIB", "sysDescr",    0),
     ("SNMPv2-MIB", "sysName",     0),
@@ -112,6 +111,7 @@ def snmp_get_status(host: str, community: str = "public", port: int = 5161) -> d
 
         for attempt in range(1, GET_RETRIES + 1):
             try:
+                # Creates a UDP transport target for the specified node(host) and port (socket wrapper)
                 transport = await UdpTransportTarget.create(
                     (host, port), timeout=GET_TIMEOUT, retries=1
                 )
@@ -127,11 +127,12 @@ def snmp_get_status(host: str, community: str = "public", port: int = 5161) -> d
         for mib, sym, idx in STATUS_OIDS_MIB:
             for attempt in range(1, GET_RETRIES + 1):
                 try:
-                    err_ind, err_status, err_idx, var_binds = await get_cmd(
+                    # Sends SNMP GET command and receives response
+                    err_ind, err_status, err_idx, var_binds = await get_cmd( #err_idx: index of failed varbind
                         engine, auth, transport, ContextData(),
                         ObjectType(ObjectIdentity(mib, sym, idx)),
                     )
-                    key = f"{mib}::{sym}.{idx}"
+                    key = f"{mib}::{sym}.{idx}"  #Creates readable key for the OID
                     if err_ind:
                         if attempt < GET_RETRIES:
                             log.warning("GET %s attempt %d failed (%s), retrying...",
@@ -139,12 +140,12 @@ def snmp_get_status(host: str, community: str = "public", port: int = 5161) -> d
                             await asyncio.sleep(0.5)
                             continue
                         results[key] = f"ERROR: {err_ind}"
-                    elif err_status:
+                    elif err_status: # Handle SNMP protocol errors
                         at = err_idx and var_binds[int(err_idx) - 1][0] or "?"
                         results[key] = f"ERROR: {err_status.prettyPrint()} at {at}"
                     else:
                         for oid, val in var_binds:
-                            results[resolve_oid(oid.prettyPrint())] = val.prettyPrint()
+                            results[resolve_oid(oid.prettyPrint())] = val.prettyPrint()  #store the result with resolved OID name
                     break
                 except Exception as exc:
                     if attempt < GET_RETRIES:
@@ -183,7 +184,7 @@ def snmp_get_status(host: str, community: str = "public", port: int = 5161) -> d
                     else:
                         results[label] = f"EXCEPTION: {exc}"
 
-        engine.close_dispatcher()
+        engine.close_dispatcher()  # Clean up transport resources
         return results
 
     loop = asyncio.new_event_loop()
@@ -238,7 +239,7 @@ def display_node_status():
     print(f"  {'-' * 54}\n")
 
 
-# ─── SNMP trap callback ───────────────────────────────────────────────────────
+# ------------------- SNMP trap callback --------------------------------------------
 def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
     while wholeMsg:
         msgVer = int(api.decodeMessageVersion(wholeMsg))
@@ -247,11 +248,11 @@ def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
             log.warning("Dropped non-SNMPv2c message (version=%s)", msgVer)
             return
 
-        pMod = api.PROTOCOL_MODULES[msgVer]
+        pMod = api.PROTOCOL_MODULES[msgVer]  # Gets the protocol module for SNMPv2c
         reqMsg, wholeMsg = decoder.decode(wholeMsg, asn1Spec=pMod.Message())
-        reqPDU = pMod.apiMessage.get_pdu(reqMsg)
+        reqPDU = pMod.apiMessage.get_pdu(reqMsg) # Extracts the PDU 
 
-        if not reqPDU.isSameTypeWith(pMod.TrapPDU()):
+        if not reqPDU.isSameTypeWith(pMod.TrapPDU()): # Exit if it is not a trap
             break
 
         agent = transportAddress[0]
@@ -260,12 +261,13 @@ def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
         event_type: str | None   = None
 
         for oid, val in pMod.apiTrapPDU.get_varbinds(reqPDU):
+            # convert oid value to strings
             oid_str = oid.prettyPrint()
             val_str = val.prettyPrint()
 
-            if oid_str == "1.3.6.1.6.3.1.1.4.1.0":
+            if oid_str == "1.3.6.1.6.3.1.1.4.1.0": # Check if this is the snmpTrapOID varbind
                 trap_oid   = val_str
-                event_type = TRAP_OID_TO_TYPE.get(val_str)
+                event_type = TRAP_OID_TO_TYPE.get(val_str)  # look up event type
             elif oid_str == "1.3.6.1.4.1.53864.1.1":
                 event_type = val_str
             elif oid_str == "1.3.6.1.4.1.53864.1.3":
@@ -289,17 +291,17 @@ def callback(transportDispatcher, transportDomain, transportAddress, wholeMsg):
     return wholeMsg
 
 
-# ─── Background dispatcher thread ────────────────────────────────────────────
+#Function to run trap listener in background thread
 def run_dispatcher():
-    loop = asyncio.new_event_loop()
+    loop = asyncio.new_event_loop() 
     asyncio.set_event_loop(loop)
 
-    transportDispatcher = AsyncioDispatcher()
-    transportDispatcher.register_transport(
+    transportDispatcher = AsyncioDispatcher() # Initializes an asynchronous dispatcher to handle incoming SNMP messages using asyncio event loop
+    transportDispatcher.register_transport(  # Registers a transport mechanism (UDP)
         udp.DOMAIN_NAME,
-        udp.UdpAsyncioTransport().open_server_mode(("0.0.0.0", 5162))
+        udp.UdpAsyncioTransport().open_server_mode(("0.0.0.0", 5162)) # Opens a UDP socket on all interfaces at port 5162 to listen for incoming SNMP traps
     )
-    transportDispatcher.register_recv_callback(callback)
+    transportDispatcher.register_recv_callback(callback) 
     transportDispatcher.job_started(1)
     log.info(json.dumps({"event": "listener_started", "host": "0.0.0.0", "port": 5162}))
 
@@ -311,7 +313,7 @@ def run_dispatcher():
         transportDispatcher.close_dispatcher()
 
 
-# ─── Display helpers ──────────────────────────────────────────────────────────
+# ----------------Displayyyyyyyyyyyyy-------------------------
 def print_trap(trap: dict):
     print(f"\n  Timestamp : {trap.get('ts', 'N/A')}")
     print(f"  Agent     : {trap['agent']}")
@@ -342,7 +344,7 @@ def display_all_traps():
 
     stop_event = threading.Event()
 
-    def watch():
+    def watch(): # Background thread function to watch for new traps and print them as they arrive, until stop_event is set
         nonlocal last_seen
         while not stop_event.is_set():
             with trap_lock:
@@ -377,7 +379,7 @@ def display_node_history():
         print_trap(trap)
 
 
-# ─── JSON log parser ──────────────────────────────────────────────────────────
+# ------------------- JSON log parser ----------------
 def load_traps_from_log(log_path: str = "traps.log") -> int:
     if not os.path.exists(log_path):
         return 0
@@ -403,7 +405,6 @@ def load_traps_from_log(log_path: str = "traps.log") -> int:
     return loaded
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     load_traps_from_log("traps.log")
 
