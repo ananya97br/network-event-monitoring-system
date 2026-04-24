@@ -60,7 +60,7 @@ Runs on each monitored machine.
 
 2. On node agents, run `SERVER_HOST="<server-ip-address>" uv run -- node_agent.py`
 <br>
-Replace `<server-ip-address>`with your server machine's ip address.
+Replace `server-ip-address` with your server machine's ip address.
 
 
 
